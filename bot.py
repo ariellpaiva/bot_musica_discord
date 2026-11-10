@@ -15,11 +15,17 @@ import asyncio
 import os
 import re
 import shutil
+import time
 from pathlib import Path
+
+import json
+import subprocess
+import sys
 
 import aiohttp
 import discord
 import spotipy
+import yt_dlp
 from discord import app_commands
 from dotenv import load_dotenv
 from spotipy.oauth2 import SpotifyOAuth
@@ -189,9 +195,13 @@ mode: str | None = None  # "spotify" | "radio" | None
 
 
 async def ensure_voice(inter: discord.Interaction) -> discord.VoiceClient:
+    global sessao
     if not inter.user.voice or not inter.user.voice.channel:
         raise RuntimeError("Entra num canal de voz primeiro.")
     vc = inter.guild.voice_client
+    if sessao is None:
+        sessao = Sessao(inter.channel)
+    sessao.canal = inter.channel  # resumo vai pro canal do último comando
     if vc is None:
         return await inter.user.voice.channel.connect(self_deaf=True)
     if vc.channel != inter.user.voice.channel:
@@ -241,6 +251,8 @@ async def run(inter: discord.Interaction, coro):
         msg, ok = f"❌ Spotify: {e.msg}", False
     except Exception as e:
         msg, ok = f"❌ {e}", False
+    if not ok:
+        print(f"[/{inter.command.name if inter.command else '?'}] {msg}")
     try:
         m = await inter.followup.send(msg, wait=True)
         await m.delete(delay=5 if ok else 15)
@@ -276,12 +288,13 @@ def build_panel(pb, can_embed: bool) -> dict:
     return {"content": None, "embed": e, "view": view}
 
 
-async def refresh_panel(force: bool = False):
+async def refresh_panel(force: bool = False, pb=None):
     global panel, panel_state
     msg = panel  # cópia local: o painel pode ser trocado/apagado durante os awaits
     if msg is None:
         return
-    pb = await asyncio.to_thread(sp.current_playback)
+    if pb is None:
+        pb = await asyncio.to_thread(sp.current_playback)
     item = (pb or {}).get("item") or {}
     state = (item.get("id"), (pb or {}).get("is_playing"), (pb or {}).get("shuffle_state"))
     if state == panel_state and not force:
@@ -329,11 +342,98 @@ async def remove_panel():
     panel, panel_state = None, None
 
 
-async def panel_loop():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
+# ---------------------------------------------------------------- Resumo da sessão
+MIN_OUVIDA = 30  # segundos pra contar como "música ouvida" (mesmo critério do Spotify)
+
+
+class Sessao:
+    """Do bot entrar no canal até o /parar. Mede o que realmente tocou."""
+
+    def __init__(self, canal):
+        self.inicio = time.monotonic()
+        self.canal = canal
+        self.spotify_seg = 0.0
+        self.faixas: dict[str, float] = {}   # id da faixa -> segundos ouvidos
+        self.radios: dict[str, float] = {}   # nome da rádio -> segundos ouvidos
+        self.youtube_seg = 0.0
+        self.videos: list[str] = []          # títulos dos vídeos tocados
+
+
+sessao: Sessao | None = None
+radio_atual: str | None = None
+
+
+def fmt_tempo(seg: float) -> str:
+    seg = int(seg)
+    h, m = divmod(seg // 60, 60)
+    if h:
+        return f"{h}h {m:02d}min"
+    if m:
+        return f"{m}min"
+    return f"{seg}s"
+
+
+def contar(dt: float, pb):
+    """Chamado a cada ~3s: soma o tempo no que tá tocando agora."""
+    if sessao is None:
+        return
+    dt = min(dt, 10)  # se o loop engasgar, não conta um pulo enorme
+    if mode == "spotify":
+        item = (pb or {}).get("item")
+        if item and pb.get("is_playing") and pb["device"]["name"].lower() == DEVICE_NAME.lower():
+            sessao.spotify_seg += dt
+            sessao.faixas[item["id"]] = sessao.faixas.get(item["id"], 0) + dt
+    elif mode == "radio" and radio_atual and any(vc.is_playing() for vc in bot.voice_clients):
+        sessao.radios[radio_atual] = sessao.radios.get(radio_atual, 0) + dt
+    elif mode == "youtube" and any(vc.is_playing() for vc in bot.voice_clients):
+        sessao.youtube_seg += dt
+
+
+def resumo(s: Sessao) -> str | None:
+    linhas = [f"📊 **Resumo da sessão** — durou {fmt_tempo(time.monotonic() - s.inicio)}"]
+    if s.spotify_seg >= 1:
+        musicas = sum(1 for seg in s.faixas.values() if seg >= MIN_OUVIDA)
+        linhas.append(f"🎧 **Spotify:** {fmt_tempo(s.spotify_seg)} tocando · "
+                      f"{musicas} música{'s' if musicas != 1 else ''} ouvida{'s' if musicas != 1 else ''}")
+    if s.radios:
+        total = sum(s.radios.values())
+        fav, fav_seg = max(s.radios.items(), key=lambda kv: kv[1])
+        linhas.append(f"📻 **Rádio:** {fmt_tempo(total)} ouvindo · favorita: **{fav}** ({fmt_tempo(fav_seg)})")
+    if s.videos:
+        n = len(s.videos)
+        linhas.append(f"🎬 **YouTube:** {fmt_tempo(s.youtube_seg)} ouvindo · {n} vídeo{'s' if n != 1 else ''}")
+    if len(linhas) == 1:
+        return None  # entrou e saiu sem tocar nada
+    return "\n".join(linhas)
+
+
+async def fechar_sessao():
+    global sessao
+    s, sessao = sessao, None
+    if s is None:
+        return
+    texto = resumo(s)
+    if texto:
         try:
-            await refresh_panel()
+            await s.canal.send(texto)
+        except discord.HTTPException as e:
+            print(f"[resumo] não consegui mandar: {e}")
+
+
+async def panel_loop():
+    """A cada 3s: soma o tempo da sessão e atualiza o painel (uma consulta só ao Spotify)."""
+    await bot.wait_until_ready()
+    ultimo = time.monotonic()
+    while not bot.is_closed():
+        agora = time.monotonic()
+        dt, ultimo = agora - ultimo, agora
+        try:
+            pb = None
+            if mode == "spotify" or panel is not None:
+                pb = await asyncio.to_thread(sp.current_playback)
+            contar(dt, pb)
+            if panel is not None:
+                await refresh_panel(pb=pb)
         except Exception as e:
             print(f"[painel] {e}")
         await asyncio.sleep(3)
@@ -396,7 +496,8 @@ class Painel(discord.ui.View):
 
 
 # ----------------------------------------------------- Spotify
-# Playlists favoritas: aparecem como sugestão no /tocar. Pra adicionar outra, é só pôr aqui.
+# Playlists favoritas: viram as opções do /playlist (máx. 25). Pra adicionar outra, é só pôr aqui
+# e reiniciar o bot.
 PLAYLISTS = {
     "funk (ariel)": "https://open.spotify.com/playlist/32eoqHKRvx8gjHq8WiwikB",
     "caxa": "https://open.spotify.com/playlist/1g5Lm66Mf68wz8pZJSvnFB",
@@ -424,7 +525,7 @@ async def pc_device() -> str:
 
 
 @tree.command(name="tocar", description="Música, álbum, playlist ou artista (link ou busca)")
-@app_commands.describe(busca="Link do Spotify, nome da música, ou escolhe uma das playlists")
+@app_commands.describe(busca="Link do Spotify ou nome da música")
 async def sp_tocar(inter: discord.Interaction, busca: str):
     async def go():
         dev = await spotify_ready(inter)
@@ -452,11 +553,17 @@ async def sp_tocar(inter: discord.Interaction, busca: str):
     await run(inter, go_painel())
 
 
-@sp_tocar.autocomplete("busca")
-async def tocar_sugestoes(inter: discord.Interaction, atual: str):
-    q = atual.lower().strip()
-    return [app_commands.Choice(name=f"🎵 Playlist {n}", value=f"playlist {n}")
-            for n in PLAYLISTS if q in f"playlist {n}" or q in n][:25]
+@tree.command(name="playlist", description="Toca uma das playlists da galera")
+@app_commands.describe(nome="Qual playlist")
+@app_commands.choices(nome=[app_commands.Choice(name=n, value=n) for n in PLAYLISTS])
+async def sp_playlist(inter: discord.Interaction, nome: app_commands.Choice[str]):
+    async def go():
+        dev = await spotify_ready(inter)
+        uri = to_uri(PLAYLISTS[nome.value])[1]
+        await asyncio.to_thread(with_retry, lambda: sp.start_playback(device_id=dev, context_uri=uri))
+        asyncio.create_task(post_panel(inter.channel))
+        return f"🎶 Tocando playlist **{nome.value}**"
+    await run(inter, go())
 
 
 @tree.command(name="fila", description="Põe uma música na fila (link ou busca)")
@@ -526,6 +633,8 @@ async def radio(inter: discord.Interaction, estacao: app_commands.Choice[str]):
         vc.play(discord.FFmpegOpusAudio(url, **FFMPEG_STREAM),
                 after=lambda e: e and print(f"[radio] {e}"))
         mode = "radio"
+        global radio_atual
+        radio_atual = nome
         return f"📻 No ar: **{nome}**"
     await run(inter, go())
 
@@ -540,7 +649,85 @@ async def radio_link(inter: discord.Interaction, url: str):
             vc.stop()
         vc.play(discord.FFmpegOpusAudio(url, **FFMPEG_STREAM))
         mode = "radio"
+        global radio_atual
+        radio_atual = "rádio pelo link"
         return "📻 No ar"
+    await run(inter, go())
+
+
+# ----------------------------------------------------- /youtube
+# O YouTube recusa (403) quando o ffmpeg baixa o link direto, principalmente em vídeo longo.
+# Então o próprio yt-dlp baixa (em pedaços, do jeito que o YouTube aceita) e passa pro ffmpeg.
+YTDL_OPTS = {"format": "bestaudio/best", "quiet": True, "no_warnings": True, "noplaylist": True}
+YT_INFO = BASE / ".yt-info.json"
+yt_proc: subprocess.Popen | None = None
+
+
+def yt_info(url: str) -> dict:
+    with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+        info = ydl.sanitize_info(ydl.extract_info(url, download=False))
+    if info.get("entries"):  # link de playlist: pega o primeiro vídeo
+        info = info["entries"][0]
+    return info
+
+
+def yt_stream(info: dict) -> subprocess.Popen:
+    """Sobe o yt-dlp baixando o áudio pro stdout (reaproveita a busca já feita)."""
+    stop_yt()
+    YT_INFO.write_text(json.dumps(info), encoding="utf-8")
+    global yt_proc
+    yt_proc = subprocess.Popen(
+        [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "-f", "bestaudio/best",
+         "--load-info-json", str(YT_INFO), "-o", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return yt_proc
+
+
+def stop_yt():
+    global yt_proc
+    if yt_proc is not None and yt_proc.poll() is None:
+        yt_proc.kill()
+        try:
+            yt_proc.wait(3)
+        except subprocess.TimeoutExpired:
+            pass
+    yt_proc = None
+
+
+@tree.command(name="youtube", description="Toca o áudio de um vídeo do YouTube pelo link")
+@app_commands.describe(link="Link do vídeo (youtube.com ou youtu.be)")
+async def youtube(inter: discord.Interaction, link: str):
+    async def go():
+        global mode
+        link_ = link.strip()
+        if not re.match(r"https?://", link_):
+            raise RuntimeError("Manda o link do vídeo (começando com https://).")
+        vc = await ensure_voice(inter)
+        try:
+            info = await asyncio.to_thread(yt_info, link_)
+        except yt_dlp.utils.DownloadError as e:
+            print(f"[youtube] erro no link {link_}: {e}")
+            raise RuntimeError(f"Não consegui abrir esse vídeo. {str(e).replace('ERROR: ', '')[:150]}")
+        print(f"[youtube] tocando: {info.get('title')} ({link_})")
+        await leave_spotify(vc)
+        if vc.is_playing():
+            vc.stop()
+        proc = await asyncio.to_thread(yt_stream, info)
+
+        def fim(e):
+            print(f"[youtube] parou de tocar{f': {e}' if e else ''}")
+            if yt_proc is proc:
+                stop_yt()
+        vc.play(discord.FFmpegOpusAudio(proc.stdout, pipe=True, options="-vn"), after=fim)
+        mode = "youtube"
+        titulo = info.get("title", "vídeo")
+        if sessao:
+            sessao.videos.append(titulo)
+        dur = info.get("duration")
+        dur_txt = f" `{int(dur) // 60}:{int(dur) % 60:02d}`" if dur else " 🔴 ao vivo" if info.get("is_live") else ""
+        return f"🎬 Tocando **{titulo}**{dur_txt}"
     await run(inter, go())
 
 
@@ -554,11 +741,14 @@ AJUDA.add_field(name="Spotify", inline=False, value=(
     "`/tocando` — mostra o painel com a música atual"
 ))
 AJUDA.add_field(name="Playlists", inline=False, value="\n".join(
-    f"`/tocar playlist {n}`" for n in PLAYLISTS
+    f"`/playlist {n}`" for n in PLAYLISTS
 ))
 AJUDA.add_field(name="Rádio", inline=False, value=(
     "`/radio <JB FM / Mix FM>` — rádio ao vivo\n"
     "`/radio-link <url>` — qualquer rádio pelo link do stream"
+))
+AJUDA.add_field(name="YouTube", inline=False, value=(
+    "`/youtube <link>` — toca o áudio de um vídeo"
 ))
 AJUDA.add_field(name="Geral", inline=False, value=(
     "`/parar` — para tudo e sai do canal\n"
@@ -576,11 +766,14 @@ tree.command(name="ajuda", description="Lista os comandos do bot")(_ajuda)
 tree.command(name="help", description="Lista os comandos do bot")(_ajuda)
 
 async def stop_all(guild: discord.Guild):
+    global radio_atual
     vc = guild.voice_client
     await leave_spotify(vc)  # já pausa o app do PC e apaga o painel
+    radio_atual = None
     if vc:
         vc.stop()
         await vc.disconnect()
+    await fechar_sessao()  # manda o resumo no chat
 
 
 @tree.command(name="parar", description="Para tudo e sai do canal")
@@ -596,9 +789,7 @@ async def on_voice_state_update(member, before, after):
     """Sai sozinho se ficar só no canal."""
     vc = member.guild.voice_client
     if vc and vc.channel and all(m.bot for m in vc.channel.members):
-        await leave_spotify(vc)
-        vc.stop()
-        await vc.disconnect()
+        await stop_all(member.guild)
 
 
 async def setup_hook():
@@ -635,8 +826,42 @@ def single_instance():
     return s  # precisa ficar vivo enquanto o bot roda
 
 
+class _Tee:
+    """Escreve na janela e no bot.log ao mesmo tempo."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self.streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def log_em_arquivo():
+    import sys
+    log = BASE / "bot.log"
+    if log.exists() and log.stat().st_size > 2_000_000:  # não deixa crescer pra sempre
+        log.replace(BASE / "bot.old.log")
+    f = open(log, "a", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, f)
+    sys.stderr = _Tee(sys.__stderr__, f)
+
+
 if __name__ == "__main__":
     _lock = single_instance()
+    log_em_arquivo()
+    print(f"\n===== bipbip ligando ({time.strftime('%d/%m %H:%M:%S')}) =====")
     if not shutil.which("ffmpeg"):
         raise SystemExit("❌ 'ffmpeg' não encontrado no PATH. Veja o README.txt.")
     if not DEVICE_NAME:
