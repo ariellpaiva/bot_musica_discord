@@ -1,0 +1,6 @@
+discord.py[voice]>=2.4
+# davey 0.2 quebra o áudio do discord.py 2.7.1 (ninguém ouve o bot). Tirar quando sair discord.py com suporte.
+davey>=0.1.6,<0.2
+spotipy>=2.24
+python-dotenv>=1.0
+aiohttp>=3.9

@@ -1,0 +1,22 @@
+# Segredos e credenciais (NUNCA commitar)
+.env
+.spotify-token
+spotify-cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Editor / SO
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
