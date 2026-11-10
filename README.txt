@@ -1,13 +1,15 @@
 BIPBIP - BOT DE MÚSICA PRO DISCORD
 ==================================
-Toca o Spotify da tua conta (pelo app oficial do PC) e as rádios JB FM e Mix FM ao vivo.
+Toca o Spotify da tua conta (pelo app oficial do PC), as rádios JB FM e Mix FM ao
+vivo e o áudio de vídeos do YouTube.
 
 
 COMANDOS
 --------
 /tocar <link ou busca>       Toca música, álbum, playlist ou artista
-/tocar playlist funk         Playlists favoritas: funk, caxa, pagode, nightdrive
-                             (aparecem como sugestão; a lista fica em PLAYLISTS no bot.py)
+/playlist <nome>             Playlists favoritas: funk (ariel), caxa, pagode, nightdrive
+                             (a lista fica em PLAYLISTS no bot.py; máx. 25. Depois de
+                             mudar, reinicia o bot)
 /fila <link ou busca>        Põe uma música na fila
 /pular  /voltar              Próxima / anterior
 /pausar  /continuar          Pausa / continua
@@ -15,10 +17,17 @@ COMANDOS
 /tocando                     Painel com a música atual e os botões ⏮️ ⏯️ ⏭️ 🔀 ⏹️
 /radio <JB FM / Mix FM>      Rádio ao vivo
 /radio-link <url>            Qualquer outra rádio pelo link do stream
+/youtube <link>              Toca o áudio de um vídeo do YouTube (link de playlist
+                             toca o 1º vídeo)
 /parar                       Para tudo e sai do canal
+/ajuda  /help                Lista os comandos
 
 Também dá pra controlar pelo app do Spotify no celular: é só escolher o
 dispositivo do PC.
+
+Resumo da sessão: no /parar (ou quando todo mundo sai do canal), o bot manda no
+chat quanto tempo tocou de Spotify, rádio e YouTube, quantas músicas foram
+ouvidas (30s ou mais) e a rádio favorita.
 
 
 INSTALAÇÃO NUM PC NOVO (Windows 10/11)
@@ -33,7 +42,8 @@ Dá dois cliques no instalar.bat. Ele instala sozinho, pelo winget:
   - Python 3.13                  roda o bot
   - ffmpeg                       toca o áudio no Discord
   - App do Spotify               é ele que toca as músicas
-  - Bibliotecas Python           tudo do requirements.txt
+  - Deno                         o yt-dlp precisa dele pro /youtube
+  - Bibliotecas Python           tudo do requirements.txt (inclui o yt-dlp)
 E cria o arquivo .env a partir do .env.example.
 
 Se der erro no meio: reinicia o PC e roda de novo (o que já está instalado é pulado).
@@ -110,7 +120,14 @@ Discord, Rotate client secret no Spotify) e atualiza o .env.
 5) Ligar o bot
 --------------
 Dá dois cliques no iniciar.bat. Pra desligar, fecha a janela.
-Se o bot cair (ex.: sem internet), ele tenta de novo sozinho em 15s.
+Ele também:
+  - abre o app do Spotify (se já estiver aberto, só traz pra frente);
+  - atualiza o yt-dlp antes de ligar (o YouTube muda direto e versão velha
+    para de funcionar);
+  - se o bot cair (ex.: sem internet), tenta de novo sozinho em 15s.
+
+Tudo que aparece na janela também é salvo no bot.log (quando passa de 2 MB,
+vira bot.old.log). Bom pra ver o que deu errado.
 
 Pelo terminal também funciona:
   python bot.py
@@ -119,6 +136,7 @@ Pelo terminal também funciona:
 LINUX
 -----
   sudo apt install ffmpeg python3-pip
+  curl -fsSL https://deno.land/install.sh | sh
   pip install -r requirements.txt
 Não tem VB-Cable: precisa de outro jeito de capturar o áudio do Spotify.
 

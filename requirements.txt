@@ -4,3 +4,5 @@ davey>=0.1.6,<0.2
 spotipy>=2.24
 python-dotenv>=1.0
 aiohttp>=3.9
+# YouTube. [default] traz o yt-dlp-ejs (precisa do Deno instalado: winget install DenoLand.Deno)
+yt-dlp[default]
