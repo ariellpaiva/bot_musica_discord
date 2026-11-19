@@ -15,6 +15,7 @@ import asyncio
 import os
 import re
 import shutil
+import string
 import time
 from pathlib import Path
 
@@ -65,7 +66,7 @@ async def wait_device(timeout: int) -> str:
         if dev:
             return dev
         await asyncio.sleep(1)
-    raise RuntimeError(f"O app do Spotify do PC (**{DEVICE_NAME}**) não apareceu. "
+    raise RuntimeError("O app do Spotify do notebook host não apareceu. "
                        "Ele tá aberto e logado?")
 
 
@@ -139,6 +140,44 @@ RADIO_URLS = {
     "jb": "https://playerservices.streamtheworld.com/api/livestream-redirect/JBFMAAC.aac",
     "mix": "https://playerservices.streamtheworld.com/api/livestream-redirect/MIXRIOAAC.aac",
 }
+# Logo (site oficial), cor do painel e "mount" do StreamTheWorld (pra saber a música tocando)
+RADIO_VISUAL = {
+    "jb": {"logo": "https://jb.fm/meta/ios/ios-appicon-180-180.png", "cor": 0x34506E,
+           "mount": "JBFMAAC", "curto": "JB FM"},
+    "mix": {"logo": "https://mixriofm.com.br/assets/img/mix180.png", "cor": 0xE30613,
+            "mount": "MIXRIOAAC", "curto": "Mix FM"},
+}
+_np_cache: dict[str, tuple[float, str | None]] = {}
+
+
+async def radio_tocando(key: str | None) -> str | None:
+    """'Artista – Música' que tá no ar (a JB informa; a Mix não). Cache de 15s."""
+    mount = RADIO_VISUAL.get(key or "", {}).get("mount")
+    if not mount:
+        return None
+    hora, valor = _np_cache.get(mount, (0, None))
+    if time.monotonic() - hora < 15:
+        return valor
+    valor = None
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://np.tritondigital.com/public/nowplaying",
+                             params={"mountName": mount, "numberToFetch": "1", "eventType": "track"},
+                             timeout=aiohttp.ClientTimeout(total=5)) as r:
+                xml = await r.text()
+        titulo = re.search(r'cue_title"><!\[CDATA\[(.*?)\]\]>', xml)
+        artista = re.search(r'track_artist_name"><!\[CDATA\[(.*?)\]\]>', xml)
+        bonito = lambda s: string.capwords(s.strip().lower())  # noqa: E731  (DON'T -> Don't)
+        if titulo and titulo.group(1).strip():
+            valor = bonito(titulo.group(1))
+            if artista and artista.group(1).strip():
+                valor = f"{bonito(artista.group(1))} – {valor}"
+    except Exception:
+        pass
+    _np_cache[mount] = (time.monotonic(), valor)
+    return valor
+
+
 RADIO_BROWSER = [
     "https://de1.api.radio-browser.info",
     "https://de2.api.radio-browser.info",
@@ -288,20 +327,41 @@ def build_panel(pb, can_embed: bool) -> dict:
     return {"content": None, "embed": e, "view": view}
 
 
+def build_radio_panel(key: str | None, nome: str | None, musica: str | None, can_embed: bool) -> dict:
+    vis = RADIO_VISUAL.get(key or "", {})
+    nome = nome or "Rádio"
+    view = RadioPainel(key)
+    if not can_embed:
+        linha = f"\n🎶 {musica}" if musica else ""
+        return {"content": f"📻 **{nome}** · 🔴 Ao vivo{linha}", "embed": None, "view": view}
+    e = discord.Embed(title=f"📻 {nome}", color=vis.get("cor", 0x5865F2),
+                      description=f"🎶 **{musica}**" if musica else "Tocando ao vivo")
+    if vis.get("logo"):
+        e.set_thumbnail(url=vis["logo"])
+    e.set_footer(text="🔴 Ao vivo")
+    return {"content": None, "embed": e, "view": view}
+
+
 async def refresh_panel(force: bool = False, pb=None):
     global panel, panel_state
     msg = panel  # cópia local: o painel pode ser trocado/apagado durante os awaits
     if msg is None:
         return
-    if pb is None:
-        pb = await asyncio.to_thread(sp.current_playback)
-    item = (pb or {}).get("item") or {}
-    state = (item.get("id"), (pb or {}).get("is_playing"), (pb or {}).get("shuffle_state"))
+    can_embed = msg.channel.permissions_for(msg.guild.me).embed_links
+    if mode == "radio":
+        musica = await radio_tocando(radio_key)
+        state = ("radio", radio_key, radio_atual, musica)
+        conteudo = lambda: build_radio_panel(radio_key, radio_atual, musica, can_embed)  # noqa: E731
+    else:
+        if pb is None:
+            pb = await asyncio.to_thread(sp.current_playback)
+        item = (pb or {}).get("item") or {}
+        state = (item.get("id"), (pb or {}).get("is_playing"), (pb or {}).get("shuffle_state"))
+        conteudo = lambda: build_panel(pb, can_embed)  # noqa: E731
     if state == panel_state and not force:
         return
     try:
-        can_embed = msg.channel.permissions_for(msg.guild.me).embed_links
-        novo = await msg.edit(**build_panel(pb, can_embed))
+        novo = await msg.edit(**conteudo())
         if panel is msg:
             panel, panel_state = novo, state
     except discord.NotFound:  # alguém apagou o painel
@@ -360,7 +420,8 @@ class Sessao:
 
 
 sessao: Sessao | None = None
-radio_atual: str | None = None
+radio_atual: str | None = None  # nome exibido da rádio no ar
+radio_key: str | None = None    # "jb" / "mix" (None = rádio por link)
 
 
 def fmt_tempo(seg: float) -> str:
@@ -429,7 +490,7 @@ async def panel_loop():
         dt, ultimo = agora - ultimo, agora
         try:
             pb = None
-            if mode == "spotify" or panel is not None:
+            if mode == "spotify":
                 pb = await asyncio.to_thread(sp.current_playback)
             contar(dt, pb)
             if panel is not None:
@@ -624,17 +685,9 @@ async def sp_tocando(inter: discord.Interaction):
 ])
 async def radio(inter: discord.Interaction, estacao: app_commands.Choice[str]):
     async def go():
-        global mode
-        vc = await ensure_voice(inter)
         url, nome = await resolve_radio(estacao.value)
-        await leave_spotify(vc)
-        if vc.is_playing():
-            vc.stop()
-        vc.play(discord.FFmpegOpusAudio(url, **FFMPEG_STREAM),
-                after=lambda e: e and print(f"[radio] {e}"))
-        mode = "radio"
-        global radio_atual
-        radio_atual = nome
+        await tocar_radio(inter, url, nome, estacao.value)
+        asyncio.create_task(post_panel(inter.channel))
         return f"📻 No ar: **{nome}**"
     await run(inter, go())
 
@@ -642,17 +695,58 @@ async def radio(inter: discord.Interaction, estacao: app_commands.Choice[str]):
 @tree.command(name="radio-link", description="Toca qualquer rádio pelo link do stream")
 async def radio_link(inter: discord.Interaction, url: str):
     async def go():
-        global mode
-        vc = await ensure_voice(inter)
-        await leave_spotify(vc)
-        if vc.is_playing():
-            vc.stop()
-        vc.play(discord.FFmpegOpusAudio(url, **FFMPEG_STREAM))
-        mode = "radio"
-        global radio_atual
-        radio_atual = "rádio pelo link"
+        await tocar_radio(inter, url, "Rádio pelo link", None)
+        asyncio.create_task(post_panel(inter.channel))
         return "📻 No ar"
     await run(inter, go())
+
+
+async def tocar_radio(inter: discord.Interaction, url: str, nome: str, key: str | None):
+    """Põe a rádio no canal. Usado pelo /radio, /radio-link e pelos botões do painel."""
+    global mode, radio_atual, radio_key
+    vc = await ensure_voice(inter)
+    if mode == "spotify":
+        await leave_spotify(vc)  # pausa o app do PC (e tira o painel do Spotify)
+    if vc.is_playing():
+        vc.stop()
+    vc.play(discord.FFmpegOpusAudio(url, **FFMPEG_STREAM),
+            after=lambda e: e and print(f"[radio] {e}"))
+    mode, radio_atual, radio_key = "radio", nome, key
+
+
+class RadioPainel(discord.ui.View):
+    """Botões do painel da rádio: troca de estação (a atual fica verde) e parar."""
+
+    def __init__(self, atual: str | None = None):
+        super().__init__(timeout=None)
+        for key, vis in RADIO_VISUAL.items():
+            b = discord.ui.Button(
+                label=vis["curto"], emoji="📻", custom_id=f"bipbip:radio:{key}",
+                style=discord.ButtonStyle.success if key == atual else discord.ButtonStyle.secondary)
+            b.callback = self._trocar(key)
+            self.add_item(b)
+        parar = discord.ui.Button(emoji="⏹️", style=discord.ButtonStyle.danger,
+                                  custom_id="bipbip:radio:parar")
+        parar.callback = self._parar
+        self.add_item(parar)
+
+    @staticmethod
+    def _trocar(key: str):
+        async def cb(inter: discord.Interaction):
+            await inter.response.defer()
+            try:
+                url, nome = await resolve_radio(key)
+                await tocar_radio(inter, url, nome, key)
+            except Exception as e:
+                await inter.followup.send(f"❌ {e}", ephemeral=True)
+                return
+            await refresh_panel(force=True)
+        return cb
+
+    @staticmethod
+    async def _parar(inter: discord.Interaction):
+        await inter.response.defer()
+        await stop_all(inter.guild)
 
 
 # ----------------------------------------------------- /youtube
@@ -752,6 +846,7 @@ AJUDA.add_field(name="YouTube", inline=False, value=(
 ))
 AJUDA.add_field(name="Geral", inline=False, value=(
     "`/parar` — para tudo e sai do canal\n"
+    "`/sair` — para tudo e desliga o notebook host (só os donos)\n"
     "`/ajuda` — esta mensagem"
 ))
 AJUDA.set_footer(text="Entra num canal de voz antes de chamar o bot. "
@@ -784,6 +879,90 @@ async def parar(inter: discord.Interaction):
     await run(inter, go())
 
 
+# ---------- /sair: desliga o notebook ----------
+DESLIGAR_EM = 60  # segundos até o Windows desligar (dá tempo de cancelar)
+AVISO_ANTES = 10  # faltando isso, a mensagem vira "desligado com sucesso"
+
+
+def donos_do_env() -> set[int]:
+    """IDs do Discord em DONO_IDS no .env (DONO_ID antigo também vale).
+    Aceita um por linha com apelido ("ariel = 123") ou só os números separados por vírgula.
+    O apelido é só pra você se achar; linha sem ID é ignorada."""
+    bruto = os.getenv("DONO_IDS") or os.getenv("DONO_ID") or ""
+    ids = set()
+    for item in re.split(r"[\n,;]+", bruto):
+        valor = re.split(r"[=:]", item, maxsplit=1)[-1].strip()
+        if valor.isdigit():
+            ids.add(int(valor))
+    return ids
+
+
+async def e_dono(user: discord.abc.User) -> bool:
+    """Quem pode desligar o PC: os IDs de DONO_IDS no .env.
+    Se estiver vazio, vale o dono do app no Discord Developer Portal."""
+    donos = donos_do_env()
+    if donos:
+        return user.id in donos
+    app = await bot.application_info()
+    if app.team:
+        return any(m.id == user.id for m in app.team.members)
+    return app.owner.id == user.id
+
+
+class CancelarDesligar(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=DESLIGAR_EM)
+        self.msg: discord.Message | None = None
+        self.aviso: asyncio.Task | None = None
+
+    async def avisar_desligado(self):
+        """Faltando AVISO_ANTES segundos, troca a mensagem pelo aviso final (ela fica no chat)."""
+        await asyncio.sleep(DESLIGAR_EM - AVISO_ANTES)
+        if self.is_finished() or not self.msg:
+            return
+        self.stop()
+        try:
+            await self.msg.edit(content="⚠️ **Notebook host desligado com sucesso.** Até a próxima!",
+                                view=None)
+        except discord.HTTPException as e:
+            print(f"[sair] não consegui editar a mensagem: {e}")
+
+    @discord.ui.button(label="Cancelar", emoji="❌", style=discord.ButtonStyle.danger)
+    async def cancelar(self, inter: discord.Interaction, _):
+        if not await e_dono(inter.user):
+            return await inter.response.send_message("🚫 Só os donos do bot podem fazer isso.", ephemeral=True)
+        subprocess.run(["shutdown", "/a"], creationflags=subprocess.CREATE_NO_WINDOW)
+        self.stop()
+        if self.aviso:
+            self.aviso.cancel()
+        await inter.response.edit_message(content="✅ Desligamento cancelado. O notebook host continua ligado.",
+                                          view=None)
+        await asyncio.sleep(15)
+        await inter.delete_original_response()
+
+
+@tree.command(name="sair", description="Para tudo e desliga o notebook host (só os donos)")
+async def sair(inter: discord.Interaction):
+    if not await e_dono(inter.user):
+        return await inter.response.send_message("🚫 Só os donos do bot podem desligar o notebook host.",
+                                                 ephemeral=True)
+    await inter.response.defer()
+    await stop_all(inter.guild)
+    r = subprocess.run(
+        ["shutdown", "/s", "/t", str(DESLIGAR_EM), "/c", "bipbip: desligando pelo comando /sair do Discord"],
+        capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    if r.returncode != 0:
+        print(f"[sair] shutdown falhou ({r.returncode}): {r.stderr.strip() or r.stdout.strip()}")
+        msg = await inter.followup.send("❌ Não consegui desligar o notebook host.", wait=True)
+        await asyncio.sleep(15)
+        return await msg.delete()
+    print("[sair] desligamento agendado")
+    view = CancelarDesligar()
+    view.msg = await inter.followup.send(f"💤 Desligando o notebook host em {DESLIGAR_EM}s. Até a próxima!",
+                                         view=view, wait=True)
+    view.aviso = asyncio.create_task(view.avisar_desligado())
+
+
 @bot.event
 async def on_voice_state_update(member, before, after):
     """Sai sozinho se ficar só no canal."""
@@ -794,6 +973,7 @@ async def on_voice_state_update(member, before, after):
 
 async def setup_hook():
     bot.add_view(Painel())  # botões de painéis antigos continuam funcionando
+    bot.add_view(RadioPainel())
     asyncio.create_task(panel_loop())
 
 
@@ -863,7 +1043,7 @@ if __name__ == "__main__":
     log_em_arquivo()
     print(f"\n===== bipbip ligando ({time.strftime('%d/%m %H:%M:%S')}) =====")
     if not shutil.which("ffmpeg"):
-        raise SystemExit("❌ 'ffmpeg' não encontrado no PATH. Veja o README.txt.")
+        raise SystemExit("❌ 'ffmpeg' não encontrado no PATH. Veja o README.")
     if not DEVICE_NAME:
         raise SystemExit("❌ Coloca SPOTIFY_PC_DEVICE no .env (nome do PC no Spotify).")
     print(f"Spotify conectado como: {sp.current_user()['display_name']}")  # 1ª vez abre o navegador

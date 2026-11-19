@@ -53,7 +53,7 @@ if errorlevel 1 (
 if not exist .env (
     copy .env.example .env > nul
     echo.
-    echo Criei o arquivo .env. Abre ele e coloca os tokens ^(ver README.txt, passo 4^).
+    echo Criei o arquivo .env. Abre ele e coloca os tokens ^(ver README.md, passo 4^).
 )
 
 echo.
